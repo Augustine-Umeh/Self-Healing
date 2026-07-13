@@ -490,6 +490,10 @@ failures:
   # media_processor, etc.). API only adds rows for orchestration it owns.
   #
   # No incident for invalid extraction_strategy (HTTP 400 client error).
+  #
+  # Fatal stage failures are emitted at the failing step (embedder_down,
+  # embed_images_inference_failed, index_image_orphan_vectors, etc.) — not a
+  # generic upload_pipeline_failed catch-all.
 
   - id: upload_finalize_ready_failed
     service: api

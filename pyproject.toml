@@ -5,7 +5,9 @@ description = "Mefid self-healing reliability agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "pydantic>=2.0",
     "pydantic-settings>=2.0",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -17,5 +19,11 @@ dev = [
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["reliability_agent*"]
+
 [tool.setuptools]
 py-modules = ["config"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
