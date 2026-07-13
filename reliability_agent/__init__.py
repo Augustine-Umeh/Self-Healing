@@ -4,15 +4,22 @@ from reliability_agent.catalog import FailureCatalog, load_catalog
 from reliability_agent.incident import (
     Incident,
     IncidentCreate,
+    IncidentRow,
     IncidentStatus,
+    validate_incident_row,
     resolve_incident,
 )
+from reliability_agent.incidents_client import IncidentClaimError, IncidentClient
 
 __all__ = [
     "FailureCatalog",
     "Incident",
+    "IncidentClaimError",
+    "IncidentClient",
     "IncidentCreate",
+    "IncidentRow",
     "IncidentStatus",
+    "validate_incident_row",
     "load_catalog",
     "resolve_incident",
 ]

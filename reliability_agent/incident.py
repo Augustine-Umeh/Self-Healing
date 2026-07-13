@@ -76,6 +76,21 @@ class Incident(BaseModel):
         return self
 
 
+class IncidentRow(BaseModel):
+    """Raw ``public.incidents`` row as returned by Supabase."""
+
+    id: UUID
+    created_at: datetime
+    status: IncidentStatus
+    failure_id: str
+    diagnosis: str
+    service: str | None = None
+    stage: str | None = None
+    media_id: UUID | None = None
+    error: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 def resolve_incident(
     payload: IncidentCreate | dict[str, Any],
     catalog: FailureCatalog | None = None,
@@ -110,4 +125,36 @@ def resolve_incident(
         media_id=create.media_id,
         error=create.error,
         metadata=create.metadata,
+    )
+
+
+def validate_incident_row(
+    row: IncidentRow | dict[str, Any],
+    catalog: FailureCatalog | None = None,
+) -> Incident:
+    """Validate a DB row against the catalog and return an Incident with DB ids."""
+    parsed = row if isinstance(row, IncidentRow) else IncidentRow.model_validate(row)
+    resolved = resolve_incident(
+        IncidentCreate(
+            failure_id=parsed.failure_id,
+            diagnosis=parsed.diagnosis,
+            service=parsed.service,
+            stage=parsed.stage,
+            media_id=parsed.media_id,
+            error=parsed.error,
+            metadata=parsed.metadata,
+        ),
+        catalog=catalog,
+    )
+    return Incident(
+        id=parsed.id,
+        created_at=parsed.created_at,
+        status=parsed.status,
+        failure_id=resolved.failure_id,
+        diagnosis=resolved.diagnosis,
+        service=resolved.service,
+        stage=resolved.stage,
+        media_id=resolved.media_id,
+        error=resolved.error,
+        metadata=resolved.metadata,
     )
