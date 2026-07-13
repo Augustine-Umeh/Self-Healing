@@ -1,4 +1,4 @@
-"""CLI: claim the next open incident (or a specific id) and log it."""
+"""CLI: claim an incident, diagnose via catalog, print plan (no remediation)."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import asyncio
 import json
 import sys
 
+from reliability_agent.diagnose import diagnose_incident
 from reliability_agent.incidents_client import IncidentClaimError, IncidentClient
 
 
@@ -24,21 +25,29 @@ async def _run(*, incident_id: str | None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
-    if incident is None:
-        print(json.dumps({"claimed": False, "message": "no open incidents"}))
-        return 0
+        if incident is None:
+            print(json.dumps({"claimed": False, "message": "no open incidents"}))
+            return 0
+
+        plan = diagnose_incident(incident, catalog=client.catalog)
 
     payload = {
         "claimed": True,
         "incident_id": str(incident.id),
         "status": incident.status.value,
         "failure_id": incident.failure_id,
-        "diagnosis": incident.diagnosis,
-        "service": incident.service,
-        "stage": incident.stage,
+        "diagnosis": plan.diagnosis,
+        "failure_class": plan.failure_class,
+        "description": plan.description,
+        "service": plan.service,
+        "stage": plan.stage,
         "media_id": str(incident.media_id) if incident.media_id else None,
         "error": incident.error,
         "created_at": incident.created_at.isoformat(),
+        "disposition": plan.disposition.value,
+        "planned_action": plan.planned_action,
+        "agent_actionable": plan.agent_actionable,
+        "reason": plan.reason,
     }
     print(json.dumps(payload, indent=2))
     return 0
@@ -46,7 +55,10 @@ async def _run(*, incident_id: str | None) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Claim a reliability incident and print diagnosis (no remediation yet)."
+        description=(
+            "Claim a reliability incident, diagnose from failures.yaml, "
+            "and print the plan (no remediation yet)."
+        )
     )
     parser.add_argument(
         "--once",

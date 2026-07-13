@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+from reliability_agent.catalog import get_catalog
 from reliability_agent.incident import Incident, IncidentStatus
 from reliability_agent.main import _run
 
@@ -13,6 +14,7 @@ from reliability_agent.main import _run
 def test_run_once_no_open_incidents(capsys) -> None:
     client = AsyncMock()
     client.claim_next_open = AsyncMock(return_value=None)
+    client.catalog = get_catalog()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
 
@@ -24,7 +26,7 @@ def test_run_once_no_open_incidents(capsys) -> None:
     assert out == {"claimed": False, "message": "no open incidents"}
 
 
-def test_run_once_claims_and_logs(capsys) -> None:
+def test_run_once_claims_and_diagnoses(capsys) -> None:
     incident = Incident(
         id=uuid4(),
         created_at=datetime.now(timezone.utc),
@@ -37,6 +39,7 @@ def test_run_once_claims_and_logs(capsys) -> None:
     )
     client = AsyncMock()
     client.claim_next_open = AsyncMock(return_value=incident)
+    client.catalog = get_catalog()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
 
@@ -50,3 +53,5 @@ def test_run_once_claims_and_logs(capsys) -> None:
     assert out["diagnosis"] == "PROCESS_DOWN"
     assert out["status"] == "processing"
     assert out["incident_id"] == str(incident.id)
+    assert out["disposition"] == "remediate"
+    assert out["planned_action"] == "restart_service"
