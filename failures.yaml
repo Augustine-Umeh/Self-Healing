@@ -1,0 +1,510 @@
+# Failure catalog: concrete Mefid failures → diagnosis codes.
+#
+# Diagnosis names describe what is wrong with the media (outcome), not the internal
+# step that failed. No separate "Class 3 audit" layer — the same names apply whether
+# detected at incident time or by a later DB check.
+#
+# Examples:
+#   FRAMES_MISSING          — no usable frames for the video
+#   TRANSCRIPT_MISSING      — no transcript rows (Whisper or DB insert failed)
+#   TRANSCRIPT_NOT_INDEXED  — transcripts exist but are not searchable
+#   CAPTION_MISSING         — no caption rows
+#   CAPTION_NOT_INDEXED     — captions exist but are not searchable
+#
+# Built in passes:
+#   1. Service availability  — PROCESS_DOWN, MODEL_NOT_LOADED
+#   2. Dependencies          — DEPENDENCY_UNREACHABLE
+#   3. Incidents (per service) — pipeline failures emitted to incidents table
+#
+# cards.yaml is the runtime layer (observe signals → rule match).
+# This file is the inventory layer (concrete failure → diagnosis).
+#
+# Optional fields:
+#   notes            — only when something is non-obvious or not wired yet
+#   service          — which Mefid service owns the failure
+#   stage            — pipeline stage (incident rows)
+#   outcome          — media/status effect (incident rows)
+#   dependency       — minio, supabase (dependency rows)
+#   agent_actionable — whether the agent can remediate (default true if omitted)
+#
+# Incident rows are only for failures NOT already covered by global service/
+# dependency rows. When embedder returns 503, use failure_id embedder_model_not_loaded
+# and put stage (e.g. embed-image) in incident metadata — do not duplicate rows.
+
+diagnoses:
+  PROCESS_DOWN:
+    failure_class: SERVICE_AVAILABILITY
+    description: Service process is not responding or cannot be reached.
+  MODEL_NOT_LOADED:
+    failure_class: SERVICE_AVAILABILITY
+    description: Service process is up but its model or index is not loaded.
+  DEPENDENCY_UNREACHABLE:
+    failure_class: DEPENDENCY_AVAILABILITY
+    description: Dependency is not reachable.
+  FRAMES_MISSING:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Video has no usable frames (extract failed or count mismatch).
+  IMAGE_EMBEDDINGS_MISSING:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Frames exist but image CLIP embeddings were not produced.
+  IMAGE_NOT_INDEXED:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Image embeddings exist but were not indexed for search.
+  TRANSCRIPT_MISSING:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Video has no transcript rows (ASR or DB insert failed).
+  TRANSCRIPT_NOT_INDEXED:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Transcript rows exist but text vectors are not searchable.
+  CAPTION_MISSING:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Video has no caption rows (captioning or DB insert failed).
+  CAPTION_NOT_INDEXED:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Caption rows exist but caption vectors are not searchable.
+  ORPHAN_VECTORS:
+    failure_class: FAISS_SUPABASE_DESYNC
+    description: FAISS has vectors Supabase cannot account for.
+  IN_MEMORY_DISK_DRIFT:
+    failure_class: FAISS_SUPABASE_DESYNC
+    description: In-memory FAISS state differs from persisted index files.
+  PARTIAL_UPLOAD:
+    failure_class: DEGRADED_MULTIMODAL
+    description: Pipeline left inconsistent state (stuck processing, partial artifacts).
+
+failures:
+  # ===========================================================================
+  # PROCESS_DOWN — service unreachable
+  # ===========================================================================
+  #
+  # detection:
+  #   poll_class_1  — GET /health/all while system is idle
+  #   incident      — failure during upload or other pipeline request
+  #   search        — failure during search request
+
+  - id: api_unreachable
+    service: api
+    diagnosis: PROCESS_DOWN
+    detection: [poll_class_1]
+    notes: Agent cannot reach Mefid API (maps to GATEWAY_UNREACHABLE in cards.yaml).
+
+  - id: media_processor_down 
+    service: media_processor
+    diagnosis: PROCESS_DOWN
+    detection: [poll_class_1, incident]
+
+  - id: embedder_down
+    service: embedder
+    diagnosis: PROCESS_DOWN
+    detection: [poll_class_1, incident, search]
+
+  - id: indexer_down
+    service: indexer
+    diagnosis: PROCESS_DOWN
+    detection: [poll_class_1, incident, search]
+
+  - id: transcribe_down
+    service: transcribe
+    diagnosis: PROCESS_DOWN
+    detection: [poll_class_1, incident]
+
+  - id: caption_down
+    service: caption
+    diagnosis: PROCESS_DOWN
+    detection: [poll_class_1, incident]
+
+  # ===========================================================================
+  # MODEL_NOT_LOADED — live but not ready to serve
+  # ===========================================================================
+  #
+  # Only services that load runtime state at startup:
+  #   embedder   → CLIP       (GET /ready → model_loaded)
+  #   indexer    → FAISS      (GET /index/stats → index_loaded)
+  #   transcribe → Whisper    (GET /ready → model_loaded)
+  #   caption    → Qwen2-VL   (engine in app.state; /health/all does not check yet)
+  #
+  # media_processor and api have no model-load gate.
+
+  - id: embedder_model_not_loaded
+    service: embedder
+    diagnosis: MODEL_NOT_LOADED
+    detection: [poll_class_1, incident, search]
+
+  - id: indexer_index_not_loaded
+    service: indexer
+    diagnosis: MODEL_NOT_LOADED
+    detection: [poll_class_1, incident, search]
+    notes: FAISS indexes not loaded; exposed as index_loaded=false in /index/stats.
+
+  - id: transcribe_model_not_loaded
+    service: transcribe
+    diagnosis: MODEL_NOT_LOADED
+    detection: [poll_class_1, incident]
+
+  - id: caption_engine_not_loaded
+    service: caption
+    diagnosis: MODEL_NOT_LOADED
+    detection: [poll_class_1, incident]
+    notes: Caption returns 503 when engine is missing; /health/all only checks liveness today.
+
+  # ===========================================================================
+  # DEPENDENCY_UNREACHABLE — dependency unreachable
+  # ===========================================================================
+
+  - id: minio_unreachable
+    dependency: minio
+    diagnosis: DEPENDENCY_UNREACHABLE
+    detection: [poll_class_1, incident]
+    notes: MinIO is not reachable.
+
+  - id: supabase_unreachable
+    dependency: supabase
+    diagnosis: DEPENDENCY_UNREACHABLE
+    detection: [poll_class_1, incident]
+    notes: Supabase is not reachable.
+
+  # ===========================================================================
+  # INCIDENTS — media_processor (POST /extract/)
+  # ===========================================================================
+  #
+  # NOT listed here (use global rows + stage: extract in incident metadata):
+  #   media_processor_down
+  #   minio_unreachable — source video download or frame JPEG upload
+  #   supabase_unreachable — insert_media or insert_frames_batch
+  #
+  # outcome:
+  #   no_media_row — failed before media row was created
+  #   failed       — media row exists; marked failed (or attempted)
+  #   processing   — media row stuck in processing
+
+  - id: extract_video_unopenable
+    service: media_processor
+    stage: extract
+    outcome: no_media_row
+    diagnosis: FRAMES_MISSING
+    detection: [incident]
+    agent_actionable: false
+    notes: OpenCV cannot open downloaded video; corrupt or unsupported codec.
+
+  - id: extract_video_invalid_fps
+    service: media_processor
+    stage: extract
+    outcome: no_media_row
+    diagnosis: FRAMES_MISSING
+    detection: [incident]
+    agent_actionable: false
+    notes: Invalid FPS; corrupt or unsupported codec.
+
+  - id: frames_missing
+    service: media_processor
+    stage: extract
+    outcome: no_media_row
+    diagnosis: FRAMES_MISSING
+    detection: [incident]
+    agent_actionable: true
+    notes: Hybrid sampling and first-frame fallback both failed.
+
+  - id: extract_hybrid_error
+    service: media_processor
+    stage: extract
+    outcome: no_media_row
+    diagnosis: FRAMES_MISSING
+    detection: [incident]
+    notes: Scene detect or hybrid sampler raised during extraction.
+
+  - id: extract_frame_count_mismatch
+    service: media_processor
+    stage: extract
+    outcome: failed
+    diagnosis: FRAMES_MISSING
+    detection: [incident]
+    notes: Inserted frame row count does not match extracted frame count.
+
+  - id: extract_mark_failed_failed
+    service: media_processor
+    stage: extract
+    outcome: processing
+    diagnosis: PARTIAL_UPLOAD
+    detection: [incident]
+    notes: Extract failed but media row could not be flipped to failed.
+
+  # ===========================================================================
+  # INCIDENTS — embedder
+  # ===========================================================================
+  #
+  # NOT listed here (use global rows + stage in incident metadata):
+  #   embedder_down, embedder_model_not_loaded — any route including search
+  #
+  # Search-time embed failures are covered by poll_class_1 on the global rows.
+  # No separate search incident entries; the agent does not heal bad user queries.
+  #
+  # outcome:
+  #   failed — upload aborts; media marked failed
+  #   ready  — upload continues; failure swallowed (transcribe/caption blocks)
+
+  - id: embed_images_invalid_frame_data
+    service: embedder
+    stage: embed-image
+    outcome: failed
+    diagnosis: FRAMES_MISSING
+    detection: [incident]
+    agent_actionable: false
+    notes: Invalid base64 or corrupt JPEG; bad frame data from extract.
+
+  - id: embed_images_inference_failed
+    service: embedder
+    stage: embed-image
+    outcome: failed
+    diagnosis: IMAGE_EMBEDDINGS_MISSING
+    detection: [incident]
+    agent_actionable: true
+    notes: CLIP image inference error; restart embedder may help (e.g. GPU OOM).
+
+  - id: embed_text_batch_invalid_input
+    service: embedder
+    stage: embed-text
+    outcome: ready
+    diagnosis: TRANSCRIPT_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: false
+    notes: Empty transcript text (HTTP 422); cannot embed.
+
+  - id: embed_text_batch_inference_failed
+    service: embedder
+    stage: embed-text
+    outcome: ready
+    diagnosis: TRANSCRIPT_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: true
+    notes: Transcript text exists but CLIP text embed failed.
+
+  - id: embed_caption_batch_invalid_input
+    service: embedder
+    stage: embed-caption
+    outcome: ready
+    diagnosis: CAPTION_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: false
+
+  - id: embed_caption_batch_inference_failed
+    service: embedder
+    stage: embed-caption
+    outcome: ready
+    diagnosis: CAPTION_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: true
+
+  # ===========================================================================
+  # INCIDENTS — indexer (POST /vectors/add/, POST /vectors/search/)
+  # ===========================================================================
+  #
+  # NOT listed here (use global rows + stage in incident metadata):
+  #   indexer_down, indexer_index_not_loaded, supabase_unreachable
+  #
+  # Search failures use global rows via poll_class_1; no search incident entries.
+  #
+  # POST /vectors/add/ order: FAISS add → Supabase insert → FAISS disk save
+  #
+  # outcome:
+  #   failed — upload aborts; media marked failed (index-image)
+  #   ready  — non-fatal in upload (index-text, index-caption)
+
+  - id: index_image_invalid_vector
+    service: indexer
+    stage: index-image
+    outcome: failed
+    diagnosis: IMAGE_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: false
+    notes: Embedding length != CLIP_DIMENSION; upstream embedder or corrupt payload.
+
+  - id: index_image_faiss_add_failed
+    service: indexer
+    stage: index-image
+    outcome: failed
+    diagnosis: IMAGE_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: true
+    notes: faiss_registry.add raised before any DB write.
+
+  - id: index_image_orphan_vectors
+    service: indexer
+    stage: index-image
+    outcome: failed
+    diagnosis: ORPHAN_VECTORS
+    detection: [incident, poll_class_2]
+    agent_actionable: false
+    notes: FAISS add succeeded; insert_embeddings_batch failed. Escalate only.
+
+  - id: index_image_faiss_disk_save_failed
+    service: indexer
+    stage: index-image
+    outcome: failed
+    diagnosis: IN_MEMORY_DISK_DRIFT
+    detection: [incident, poll_class_2]
+    agent_actionable: true
+    notes: DB rows written but faiss_registry.save failed.
+
+  - id: index_text_invalid_vector
+    service: indexer
+    stage: index-text
+    outcome: ready
+    diagnosis: TRANSCRIPT_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: false
+
+  - id: index_text_faiss_add_failed
+    service: indexer
+    stage: index-text
+    outcome: ready
+    diagnosis: TRANSCRIPT_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: true
+
+  - id: index_text_orphan_vectors
+    service: indexer
+    stage: index-text
+    outcome: ready
+    diagnosis: ORPHAN_VECTORS
+    detection: [incident, poll_class_2]
+    agent_actionable: false
+    notes: FAISS has transcript vectors without matching Supabase rows.
+
+  - id: index_text_faiss_disk_save_failed
+    service: indexer
+    stage: index-text
+    outcome: ready
+    diagnosis: IN_MEMORY_DISK_DRIFT
+    detection: [incident, poll_class_2]
+    agent_actionable: true
+
+  - id: index_caption_invalid_vector
+    service: indexer
+    stage: index-caption
+    outcome: ready
+    diagnosis: CAPTION_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: false
+
+  - id: index_caption_faiss_add_failed
+    service: indexer
+    stage: index-caption
+    outcome: ready
+    diagnosis: CAPTION_NOT_INDEXED
+    detection: [incident]
+    agent_actionable: true
+
+  - id: index_caption_orphan_vectors
+    service: indexer
+    stage: index-caption
+    outcome: ready
+    diagnosis: ORPHAN_VECTORS
+    detection: [incident, poll_class_2]
+    agent_actionable: false
+
+  - id: index_caption_faiss_disk_save_failed
+    service: indexer
+    stage: index-caption
+    outcome: ready
+    diagnosis: IN_MEMORY_DISK_DRIFT
+    detection: [incident, poll_class_2]
+    agent_actionable: true
+
+  # ===========================================================================
+  # INCIDENTS — transcribe (POST /transcribe/)
+  # ===========================================================================
+  #
+  # NOT listed here (use global rows + stage in incident metadata):
+  #   transcribe_down, transcribe_model_not_loaded
+  #   minio_unreachable — video download from MinIO
+  #   supabase_unreachable — when Supabase is entirely down
+  #
+  # Transcribe is non-fatal in upload_route; failures leave media as ready
+  # with diagnosis TRANSCRIPT_MISSING.
+  #
+  # No incident for empty segments (no speech detected) — valid empty result.
+
+  - id: transcript_missing
+    service: transcribe
+    stage: transcribe
+    outcome: ready
+    diagnosis: TRANSCRIPT_MISSING
+    detection: [incident]
+    agent_actionable: true
+    notes: Whisper transcribe_to_chunks raised; no transcript rows stored.
+
+  - id: transcript_missing_db_insert
+    service: transcribe
+    stage: transcribe
+    outcome: ready
+    diagnosis: TRANSCRIPT_MISSING
+    detection: [incident]
+    agent_actionable: true
+    notes: ASR succeeded but insert_transcripts_batch failed; no transcript rows in DB.
+
+  # ===========================================================================
+  # INCIDENTS — caption (POST /caption/)
+  # ===========================================================================
+  #
+  # NOT listed here (use global rows + stage in incident metadata):
+  #   caption_down, caption_engine_not_loaded
+  #   minio_unreachable — video download from MinIO
+  #   supabase_unreachable — when Supabase is entirely down
+  #
+  # Caption is non-fatal in upload_route; failures leave media as ready
+  # with diagnosis CAPTION_MISSING.
+  #
+  # No incident for empty segments — valid empty result.
+  # Merge-gate dedup skips are not incidents (captions still saved).
+
+  - id: caption_missing
+    service: caption
+    stage: caption
+    outcome: ready
+    diagnosis: CAPTION_MISSING
+    detection: [incident]
+    agent_actionable: true
+    notes: caption_video raised; no caption rows stored.
+
+  - id: caption_missing_db_insert
+    service: caption
+    stage: caption
+    outcome: ready
+    diagnosis: CAPTION_MISSING
+    detection: [incident]
+    agent_actionable: true
+    notes: Captioning succeeded but insert_captions_batch failed; no caption rows in DB.
+
+  # ===========================================================================
+  # INCIDENTS — api (upload orchestration)
+  # ===========================================================================
+  #
+  # API-owned steps in POST /upload/video and POST /upload/image.
+  #
+  # NOT listed here (use global rows + stage in incident metadata):
+  #   api_unreachable — agent cannot reach API
+  #   minio_unreachable — upload_video_minio_failed, upload_image_minio_failed
+  #   supabase_unreachable — when DB is entirely down
+  #
+  # Fatal pipeline errors use the owning service failure_id (embedder, indexer,
+  # media_processor, etc.). API only adds rows for orchestration it owns.
+  #
+  # No incident for invalid extraction_strategy (HTTP 400 client error).
+
+  - id: upload_finalize_ready_failed
+    service: api
+    stage: finalize
+    outcome: processing
+    diagnosis: PARTIAL_UPLOAD
+    detection: [incident, poll_stuck_media]
+    agent_actionable: true
+    notes: Pipeline completed but update_media(ready) failed; media stuck processing.
+
+  - id: upload_mark_failed_failed
+    service: api
+    stage: finalize
+    outcome: processing
+    diagnosis: PARTIAL_UPLOAD
+    detection: [incident, poll_stuck_media]
+    agent_actionable: true
+    notes: Fatal upload error but _try_mark_failed could not update Supabase.
